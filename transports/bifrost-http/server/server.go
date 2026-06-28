@@ -162,7 +162,8 @@ type BifrostHTTPServer struct {
 	TempTokens           *temptoken.Service
 	TempTokenSweepWorker *temptoken.SweepWorker
 	OAuth2SweepWorker    *oauth2SweepWorker
-	OAuth2ConsentHandler *handlers.OAuth2ConsentHandler
+	OAuth2ConsentHandler  *handlers.OAuth2ConsentHandler
+	OAuth2IssuanceHandler *handlers.OAuth2IssuanceHandler
 
 	wsPool *bfws.Pool
 }
@@ -1404,7 +1405,10 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 	featureFlagsHandler := handlers.NewFeatureFlagsHandler(s.Config.FeatureFlags, s.Config.ConfigStore)
 	// Going ahead with API handlers
 	handlers.NewOAuth2DiscoveryHandler(s.Config).RegisterRoutes(s.Router, middlewares...)
-	handlers.NewOAuth2IssuanceHandler(s.Config, s.TempTokens).RegisterRoutes(s.Router)
+	if s.OAuth2IssuanceHandler == nil {
+		s.OAuth2IssuanceHandler = handlers.NewOAuth2IssuanceHandler(s.Config, s.TempTokens, nil)
+	}
+	s.OAuth2IssuanceHandler.RegisterRoutes(s.Router)
 	handlers.NewOAuth2SessionsHandler(s.Config).RegisterRoutes(s.Router, middlewares...)
 	if s.OAuth2ConsentHandler == nil {
 		s.OAuth2ConsentHandler = handlers.NewOAuth2ConsentHandler(s.Config, s.TempTokens, nil)
