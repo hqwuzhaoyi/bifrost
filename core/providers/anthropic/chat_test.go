@@ -1628,3 +1628,36 @@ func TestToBifrostChatCompletionStream_MixedToolBlocks(t *testing.T) {
 		t.Errorf("args accumulated arguments = %q, want %q", args[argIdx], `{"y":2}`)
 	}
 }
+
+func TestToBifrostChatCompletionStream_ErrorEventReturnsBifrostError(t *testing.T) {
+	msg := "[1305]访问量过大 mock fake 200"
+	event := &AnthropicStreamEvent{
+		Type: AnthropicStreamEventTypeError,
+		Error: &AnthropicStreamError{
+			Type:    "overloaded_error",
+			Message: msg,
+		},
+	}
+	resp, bErr, isLast := event.ToBifrostChatCompletionStream(nil, "", NewAnthropicStreamState())
+	if resp != nil {
+		t.Fatalf("expected no response for stream error event, got %#v", resp)
+	}
+	if isLast {
+		t.Fatal("error event should not be treated as normal last chunk")
+	}
+	if bErr == nil || bErr.Error == nil {
+		t.Fatal("expected BifrostError for stream error event")
+	}
+	if bErr.IsBifrostError {
+		t.Fatal("provider stream error should be marked as upstream/provider error")
+	}
+	if bErr.StatusCode == nil || *bErr.StatusCode != 529 {
+		t.Fatalf("expected synthetic 529 status for stream overload, got %#v", bErr.StatusCode)
+	}
+	if bErr.Error.Type == nil || *bErr.Error.Type != "overloaded_error" {
+		t.Fatalf("expected overloaded_error type, got %#v", bErr.Error.Type)
+	}
+	if !strings.Contains(bErr.Error.Message, "1305") {
+		t.Fatalf("expected error message to contain 1305, got %q", bErr.Error.Message)
+	}
+}

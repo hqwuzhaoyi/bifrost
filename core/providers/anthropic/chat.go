@@ -1435,18 +1435,21 @@ func (chunk *AnthropicStreamEvent) ToBifrostChatCompletionStream(ctx *schemas.Bi
 		return nil, nil, false
 
 	case AnthropicStreamEventTypeError:
+		errorType := "api_error"
+		message := "anthropic stream error"
 		if chunk.Error != nil {
-			// Send error through channel before closing
-			bifrostErr := &schemas.BifrostError{
-				IsBifrostError: false,
-				Error: &schemas.ErrorField{
-					Type:    &chunk.Error.Type,
-					Message: chunk.Error.Message,
-				},
+			if chunk.Error.Type != "" {
+				errorType = chunk.Error.Type
 			}
-
-			return nil, bifrostErr, true
+			if chunk.Error.Message != "" {
+				message = chunk.Error.Message
+			}
 		}
+		// Anthropic-compatible gateways can return HTTP 200 and then emit an
+		// SSE error event as the first stream frame ("fake 200"). Convert it
+		// into a BifrostError chunk so core first-chunk lookahead can surface it
+		// as a retriable attempt failure and engage routing-rule fallbacks.
+		return nil, providerUtils.NewProviderAPIError(message, fmt.Errorf("%s", message), 529, &errorType, nil), false
 	}
 
 	return nil, nil, false

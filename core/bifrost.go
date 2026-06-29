@@ -40,8 +40,8 @@ import (
 	"github.com/maximhq/bifrost/core/providers/parasail"
 	"github.com/maximhq/bifrost/core/providers/perplexity"
 	"github.com/maximhq/bifrost/core/providers/replicate"
-	"github.com/maximhq/bifrost/core/providers/runway"
 	"github.com/maximhq/bifrost/core/providers/runware"
+	"github.com/maximhq/bifrost/core/providers/runway"
 	"github.com/maximhq/bifrost/core/providers/sgl"
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/providers/vertex"
@@ -5436,7 +5436,25 @@ func (bifrost *Bifrost) tryStreamRequest(ctx *schemas.BifrostContext, req *schem
 	select {
 	case stream := <-msg.ResponseStream:
 		bifrost.releaseChannelMessage(msg)
-		return stream, nil
+		// First-chunk lookahead: providers signal mid-stream upstream errors
+		// (e.g. "fake 200" — upstream returns 200 OK SSE header followed by an
+		// error payload in the body) by emitting a BifrostStreamChunk that
+		// carries only a BifrostError. Without this peek, tryStreamRequest
+		// returns the stream channel up to handleStreamRequest immediately on
+		// connection success; the for-loop in handleStreamRequest has already
+		// exited by the time the error chunk is read downstream, so fallbacks
+		// configured on the routing rule are never invoked. See upstream
+		// issues #2917 ("Retry on stream errors when no chunk was sent") and
+		// #3261 ("Routing-rule fallbacks not invoked when primary target
+		// returns 4xx").
+		//
+		// We peek exactly one chunk: if it is an error-only chunk, surface
+		// the BifrostError as a connection-level failure so the outer
+		// fallback loop can try the next target. Otherwise the chunk carries
+		// real response data — we splice it back at the head of the stream
+		// via a small bridging goroutine and return the spliced stream
+		// unchanged.
+		return bifrost.peekFirstStreamChunk(ctx, stream, req, provider, model)
 	case bifrostErrVal := <-msg.Err:
 		if bifrostErrVal.Error != nil {
 			bifrost.logger.Debug("error while executing stream request: %s", bifrostErrVal.Error.Message)
@@ -5466,6 +5484,110 @@ func (bifrost *Bifrost) tryStreamRequest(ctx *schemas.BifrostContext, req *schem
 		// Worker still holds msg.ResponseStream/msg.Err; releasing now corrupts the
 		// next request that reuses those pooled channels.
 		return nil, newBifrostCtxDoneError(ctx, "while waiting for stream response")
+	}
+}
+
+// isErrorOnlyChunk reports whether the first stream chunk carries a
+// BifrostError. This is how providers signal an upstream error after the HTTP
+// connection has already returned 200 (e.g. SSE body containing `{"error":...}`
+// or an upstream "fake 200" that CCH-style gateways have translated into a
+// stream error chunk).
+//
+// This predicate is intentionally used only by peekFirstStreamChunk before any
+// bytes have been sent to the caller. At that point even a chunk that also
+// carries an empty/auxiliary response object is safer to surface as an attempt
+// failure so the routing-rule fallback loop can run. Once downstream has seen
+// real tokens, later stream errors still flow through the normal streaming
+// error path and do not trigger fallback.
+func isErrorOnlyChunk(c *schemas.BifrostStreamChunk) bool {
+	return c != nil && c.BifrostError != nil
+}
+
+// peekFirstStreamChunk peeks the first chunk emitted by a provider stream so
+// that mid-stream errors which surface only after the HTTP layer returned 200
+// can still trigger fallback at handleStreamRequest's outer loop.
+//
+// Three outcomes:
+//
+//  1. First chunk is an error-only chunk: surface the embedded BifrostError as
+//     the function's error return so handleStreamRequest treats this attempt
+//     as a connection-level failure and proceeds to the next fallback target.
+//
+//  2. First chunk carries real data: splice it back at the head of the stream
+//     using a bridging goroutine so downstream consumers see the original
+//     chunk order, then return the spliced stream with nil error.
+//
+//  3. Upstream stream closes before emitting any chunk: surface a synthetic
+//     "upstream closed stream without sending any chunk" error so the
+//     fallback loop can engage.
+//
+// ctx.Done() is honored throughout — a cancelled request will not block on the
+// peek and will short-circuit with a context-done error rather than stalling
+// the outer fallback loop.
+//
+// This function is intentionally O(1) (peeks exactly one chunk) so TTFB is
+// not measurably worse for healthy streams: the producer goroutine is already
+// producing chunks before tryStreamRequest's case-arm fires, and the bridging
+// goroutine forwards them at line rate after the first one is spliced back.
+func (bifrost *Bifrost) peekFirstStreamChunk(
+	ctx *schemas.BifrostContext,
+	stream chan *schemas.BifrostStreamChunk,
+	req *schemas.BifrostRequest,
+	provider schemas.ModelProvider,
+	model string,
+) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	select {
+	case first, ok := <-stream:
+		if !ok {
+			// Stream closed before emitting any chunk. Surface as a
+			// connection-level failure so the outer fallback loop runs.
+			bifrostErr := newBifrostErrorFromMsg("upstream closed stream without sending any chunk")
+			bifrostErr.PopulateExtraFields(req.RequestType, provider, model, model)
+			return nil, bifrostErr
+		}
+		if isErrorOnlyChunk(first) {
+			// Surface the upstream error at the connection level. The
+			// outer handleStreamRequest fallback loop checks
+			// shouldContinueWithFallbacks / shouldTryFallbacks on this
+			// error to decide whether to attempt the next fallback target.
+			be := first.BifrostError
+			be.PopulateExtraFields(req.RequestType, provider, model, model)
+			if bifrost != nil && bifrost.logger != nil {
+				bifrost.logger.Warn("peek detected error-only first chunk; surfacing stream error for fallback: provider=%s model=%s error=%s", provider, model, be.GetErrorString())
+			}
+			// Drain the underlying stream so the producer goroutine can
+			// exit cleanly rather than blocking on its next send.
+			go func() {
+				for range stream {
+				}
+			}()
+			return nil, be
+		}
+		// Real first chunk. Splice it back at the head of the stream so
+		// downstream consumers receive it in order.
+		spliced := make(chan *schemas.BifrostStreamChunk, 1)
+		spliced <- first
+		go func() {
+			defer close(spliced)
+			for chunk := range stream {
+				select {
+				case spliced <- chunk:
+				case <-ctx.Done():
+					// Drain the upstream so its producer can exit cleanly.
+					for range stream {
+					}
+					return
+				}
+			}
+		}()
+		return spliced, nil
+	case <-ctx.Done():
+		// Drain the stream so its producer can exit cleanly.
+		go func() {
+			for range stream {
+			}
+		}()
+		return nil, newBifrostCtxDoneError(ctx, "while peeking first stream chunk")
 	}
 }
 
