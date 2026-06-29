@@ -1668,6 +1668,20 @@ func (h *CompletionHandler) handleStreamingTranscriptionRequest(ctx *fasthttp.Re
 	h.handleStreamingResponse(ctx, bifrostCtx, getStream, cancel)
 }
 
+func prependHTTPStreamChunk(first *schemas.BifrostStreamChunk, rest chan *schemas.BifrostStreamChunk) chan *schemas.BifrostStreamChunk {
+	out := make(chan *schemas.BifrostStreamChunk)
+	go func() {
+		defer close(out)
+		if first != nil {
+			out <- first
+		}
+		for chunk := range rest {
+			out <- chunk
+		}
+	}()
+	return out
+}
+
 // handleStreamingResponse is a generic function to handle streaming responses using Server-Sent Events (SSE)
 // The cancel function is called ONLY when client disconnects are detected via write errors.
 // Bifrost handles cleanup internally for normal completion and errors, so we only cancel
@@ -1680,6 +1694,35 @@ func (h *CompletionHandler) handleStreamingResponse(ctx *fasthttp.RequestCtx, bi
 		cancel()
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
 		SendBifrostError(ctx, bifrostErr)
+		return
+	}
+
+	// Before committing SSE headers, synchronously peek the first stream chunk.
+	// Some providers (and plugin short-circuit streams) surface upstream fake-200
+	// failures as a BifrostError chunk after stream setup. If we let that reach
+	// the SSE writer, the client receives an event-stream 529 instead of a normal
+	// HTTP error/fallback path. Peeking here keeps the response uncommitted for
+	// first-chunk failures and splices successful first chunks back into the
+	// stream without reordering.
+	select {
+	case first, ok := <-stream:
+		if !ok {
+			cancel()
+			SendError(ctx, fasthttp.StatusBadGateway, "upstream stream closed before sending any chunk")
+			return
+		}
+		if first != nil && first.BifrostError != nil {
+			cancel()
+			forwardProviderHeadersFromContext(ctx, bifrostCtx)
+			SendBifrostError(ctx, first.BifrostError)
+			for range stream {
+			}
+			return
+		}
+		stream = prependHTTPStreamChunk(first, stream)
+	case <-bifrostCtx.Done():
+		cancel()
+		SendError(ctx, fasthttp.StatusGatewayTimeout, "request cancelled before upstream sent first chunk")
 		return
 	}
 

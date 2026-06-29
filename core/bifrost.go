@@ -4859,6 +4859,9 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 	bifrost.logger.Debug(fmt.Sprintf("primary provider %s with model %s and %d fallbacks", provider, model, len(fallbacks)))
 
 	primaryResult, primaryErr := bifrost.tryStreamRequest(ctx, req)
+	if primaryErr == nil {
+		primaryResult, primaryErr = bifrost.peekFirstStreamChunk(ctx, primaryResult, req, provider, model)
+	}
 	if primaryErr != nil {
 		if primaryErr.Error != nil {
 			bifrost.logger.Debug(fmt.Sprintf("primary provider %s with model %s returned error: %s", provider, model, primaryErr.Error.Message))
@@ -4910,6 +4913,9 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 
 		// Try the fallback provider
 		result, fallbackErr := bifrost.tryStreamRequest(ctx, fallbackReq)
+		if fallbackErr == nil {
+			result, fallbackErr = bifrost.peekFirstStreamChunk(ctx, result, fallbackReq, fallback.Provider, fallback.Model)
+		}
 		// Layer on Primary/IsFallback on errors. For the success case the
 		// result is a chan of stream chunks emitted asynchronously — those
 		// chunks already carry per-attempt RoutingInfo populated upstream,
@@ -5332,7 +5338,7 @@ func (bifrost *Bifrost) tryStreamRequest(ctx *schemas.BifrostContext, req *schem
 				}
 			}()
 
-			return outputStream, nil
+			return bifrost.peekFirstStreamChunk(ctx, outputStream, req, provider, model)
 		}
 		// Handle short-circuit with error
 		if shortCircuit.Error != nil {

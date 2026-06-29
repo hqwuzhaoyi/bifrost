@@ -743,6 +743,7 @@ func HandleAnthropicChatCompletionStreaming(
 		defer stopCancellation()
 
 		sseReader := providerUtils.GetSSEEventReader(ctx, reader)
+		usedBufferedBodyFallback := false
 
 		chunkIndex := 0
 
@@ -801,6 +802,28 @@ func HandleAnthropicChatCompletionStreaming(
 					return
 				}
 				if readErr != io.EOF {
+					// Some fast-closing Anthropic-compatible gateways complete the HTTP
+					// response before fasthttp exposes a readable BodyStream. In that
+					// case fasthttp can surface "stream closed" while the full SSE body
+					// is buffered on resp.Body(). Only try this after the stream reader
+					// has already failed (so we don't block live streams by calling
+					// Body() early), and only once before treating it as a real error.
+					if chunkIndex == 0 && !usedBufferedBodyFallback && strings.Contains(readErr.Error(), "stream closed") {
+						if bufferedBody := resp.Body(); len(bufferedBody) > 0 {
+							usedBufferedBodyFallback = true
+							logger.Debug("using buffered SSE body fallback for %s after stream closed, bytes=%d", providerName, len(bufferedBody))
+							sseReader = providerUtils.GetSSEEventReader(ctx, bytes.NewReader(bufferedBody))
+							continue
+						}
+					}
+					// Some Anthropic-compatible upstreams/fasthttp body streams report a
+					// normal server-side close as "stream closed" instead of io.EOF. If
+					// we already emitted at least one normal chunk, treat that as clean
+					// EOF so a successful fallback stream is not overwritten by a
+					// terminal transport-close artifact.
+					if chunkIndex > 0 && strings.Contains(readErr.Error(), "stream closed") {
+						break
+					}
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 					logger.Warn("Error reading %s stream: %v", providerName, readErr)
 					providerUtils.ProcessAndSendError(ctx, postHookRunner, readErr, responseChan, logger, postHookSpanFinalizer)
@@ -814,8 +837,16 @@ func HandleAnthropicChatCompletionStreaming(
 			}
 			var event AnthropicStreamEvent
 			if err := sonic.Unmarshal([]byte(eventData), &event); err != nil {
-				logger.Warn("Failed to parse message_start event: %v", err)
+				logger.Warn("Failed to parse stream event: %v", err)
 				continue
+			}
+			// Some Anthropic-compatible gateways emit SSE `event: error` but put
+			// provider-specific values such as `overloaded_error` in data.type.
+			// The SSE event field is authoritative for stream framing; force the
+			// converter down the error path so fake-200 first frames can trigger
+			// core fallback instead of being ignored until EOF.
+			if eventType == string(AnthropicStreamEventTypeError) {
+				event.Type = AnthropicStreamEventTypeError
 			}
 			if event.Type == AnthropicStreamEventTypeMessageStart && event.Message != nil && event.Message.ID != "" {
 				messageID = event.Message.ID
