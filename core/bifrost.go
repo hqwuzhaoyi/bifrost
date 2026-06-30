@@ -4814,9 +4814,11 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 		lastErr = fallbackErr
 	}
 
-	ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelError, fmt.Sprintf("All %d fallback(s) exhausted; returning primary error (%s)", len(fallbacks), routingErrorSummary(primaryErr)))
-	// All providers failed, return the original error
-	return nil, primaryErr
+	ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelError, fmt.Sprintf("All %d fallback(s) exhausted; returning last fallback error (%s)", len(fallbacks), routingErrorSummary(lastErr)))
+	// All providers failed. Return the most recent attempt's error, not the
+	// primary error, so degraded clients see the terminal provider/model that
+	// actually exhausted the chain instead of a stale first-attempt failure.
+	return nil, fallbackExhaustedError(primaryErr, lastErr)
 }
 
 // handleStreamRequest handles the stream request to the provider based on the request type
@@ -4944,9 +4946,11 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 		lastErr = fallbackErr
 	}
 
-	ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelError, fmt.Sprintf("All %d fallback(s) exhausted; returning primary error (%s)", len(fallbacks), routingErrorSummary(primaryErr)))
-	// All providers failed, return the original error
-	return nil, primaryErr
+	ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelError, fmt.Sprintf("All %d fallback(s) exhausted; returning last fallback error (%s)", len(fallbacks), routingErrorSummary(lastErr)))
+	// All providers failed. Return the most recent attempt's error, not the
+	// primary error, so degraded clients see the terminal provider/model that
+	// actually exhausted the chain instead of a stale first-attempt failure.
+	return nil, fallbackExhaustedError(primaryErr, lastErr)
 }
 
 // tryRequest is a generic function that handles common request processing logic

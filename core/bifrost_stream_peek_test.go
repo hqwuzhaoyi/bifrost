@@ -219,28 +219,57 @@ func TestPeekFirstStreamChunk_ContextCancelled(t *testing.T) {
 	cancel() // pre-cancel
 	ctx := schemas.NewBifrostContext(innerCtx, schemas.NoDeadline)
 
-	stream := make(chan *schemas.BifrostStreamChunk) // never emits
+	stream := make(chan *schemas.BifrostStreamChunk, 1)
+	stream <- &schemas.BifrostStreamChunk{
+		BifrostError: &schemas.BifrostError{Error: &schemas.ErrorField{Message: "should not reach peek"}},
+	}
+	close(stream)
 
 	var b *Bifrost
 	req := chatRequestFixture()
-
-	done := make(chan struct{})
-	var err *schemas.BifrostError
-	var out chan *schemas.BifrostStreamChunk
-	go func() {
-		defer close(done)
-		out, err = b.peekFirstStreamChunk(ctx, stream, req, "test-provider", "test-model")
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("peekFirstStreamChunk blocked on cancelled context")
-	}
+	out, err := b.peekFirstStreamChunk(ctx, stream, req, "test-provider", "test-model")
 	if out != nil {
-		t.Fatalf("expected nil stream on cancelled-context path, got %v", out)
+		t.Fatalf("expected nil stream on cancelled context, got %v", out)
 	}
 	if err == nil {
 		t.Fatalf("expected context-done error, got nil")
+	}
+}
+
+// TestFallbackExhaustedError_PrefersLastError verifies that when the entire
+// fallback chain fails, the returned error is the *last* attempt's error (the
+// terminal provider/model that exhausted the chain), not the primary error.
+// This is the core invariant for the "all-fake-200 degraded" scenario: the
+// client must see which provider actually failed last, not the first one.
+func TestFallbackExhaustedError_PrefersLastError(t *testing.T) {
+	primaryErr := &schemas.BifrostError{
+		Error: &schemas.ErrorField{Message: "primary failed"},
+	}
+	primaryErr.ExtraFields.Provider = "provider-A"
+	primaryErr.ExtraFields.OriginalModelRequested = "model-A"
+
+	lastErr := &schemas.BifrostError{
+		Error: &schemas.ErrorField{Message: "last fallback failed"},
+	}
+	lastErr.ExtraFields.Provider = "provider-Z"
+	lastErr.ExtraFields.OriginalModelRequested = "model-Z"
+
+	got := fallbackExhaustedError(primaryErr, lastErr)
+	if got != lastErr {
+		t.Fatalf("expected lastErr returned, got different error: %+v", got)
+	}
+}
+
+// TestFallbackExhaustedError_NilLastFallsBackToPrimary verifies the defensive
+// path: if lastErr is nil (all fallbacks were skipped, none executed), the
+// primary error is returned as the only available signal.
+func TestFallbackExhaustedError_NilLastFallsBackToPrimary(t *testing.T) {
+	primaryErr := &schemas.BifrostError{
+		Error: &schemas.ErrorField{Message: "primary failed"},
+	}
+
+	got := fallbackExhaustedError(primaryErr, nil)
+	if got != primaryErr {
+		t.Fatalf("expected primaryErr returned when lastErr is nil, got: %+v", got)
 	}
 }

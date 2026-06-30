@@ -245,6 +245,21 @@ func routingErrorSummary(e *schemas.BifrostError) string {
 	return strings.Join(parts, " ")
 }
 
+// fallbackExhaustedError decides which error to return when every provider in
+// the fallback chain (primary + all fallbacks) has failed.
+//
+// If lastErr is non-nil it is preferred — it carries the terminal
+// provider/model that actually exhausted the chain, which is what a degraded
+// client needs to see. If lastErr is nil (e.g. all fallbacks were skipped due
+// to missing provider config and never executed), the primary error is
+// returned as the only signal available.
+func fallbackExhaustedError(primaryErr, lastErr *schemas.BifrostError) *schemas.BifrostError {
+	if lastErr != nil {
+		return lastErr
+	}
+	return primaryErr
+}
+
 // newBifrostError wraps a standard error into a BifrostError with IsBifrostError set to false.
 // This helper function reduces code duplication when handling non-Bifrost errors.
 func newBifrostError(err error) *schemas.BifrostError {
